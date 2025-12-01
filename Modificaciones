@@ -121,6 +121,25 @@ def bm25_score(query_tokens, docs, idf, avgdl, k = 1.2, b = 0.75):
         scores.append(score)
     return scores
 
+# MODIFICACION, extraemos el bm25
+def build_bm25(corpus):
+    docs = [c["tokens"] for c in corpus]
+    N = len(docs)
+    doc_lengths = [len(d) for d in docs]
+    avgdl = sum(doc_lengths) / N
+
+    df = Counter()
+    for doc in docs:
+        df.update(set(doc))
+
+    idf = {term: math.log(1 + (N - df[term] + 0.5) / (df[term] + 0.5)) for term in df}
+
+    return docs, idf, avgdl
+
+
+
+
+
 
 
 def get_contexto(tipo_contexto: int = 0, k: int = 5, tipo_chunk: int = 0, cuestionario: list[dict] = load_json()):
@@ -142,30 +161,51 @@ def get_contexto(tipo_contexto: int = 0, k: int = 5, tipo_chunk: int = 0, cuesti
     if tipo_contexto == 0:  # cuerpo baseline
         context = [""] * 50
 
+
+
+# MODIFICADO
     elif tipo_contexto == 1:
-        # particularidades de bm25
-        docs = [c["tokens"] for c in corpus]
-        N = len(docs)
-        doc_lengths = [len(d) for d in docs]
-        avgdl = sum(doc_lengths) / N
+    # --- BM25 CALCULADO UNA SOLA VEZ ---
+    docs = [c["tokens"] for c in corpus]
+    N = len(docs)
 
-        # Registraremos en df(term) la cantidad de chunks en los que aparece term
-        df = Counter()
+    # Longitudes e índice promedio del documento
+    doc_lengths = [len(d) for d in docs]
+    avgdl = sum(doc_lengths) / N
 
-        for doc in docs:
-            unique_terms = set(doc)
-            for term in unique_terms:
-                df[term] += 1
+    # Cálculo eficiente de df(term)
+    df = Counter()
+    for doc in docs:
+        df.update(set(doc))   # más limpio y rápido
 
-        # Inverse Document Frequency
-        # Diccionario que contiene el IDF de cada palabra en los chunks
-        idf = {term: math.log(1 + (N - df[term] + 0.5) / (df[term] + 0.5)) for term in df}
+    # Cálculo vectorizado del IDF
+    idf = {
+        term: math.log(1 + (N - df[term] + 0.5) / (df[term] + 0.5))
+        for term in df
+    }
 
-        for i in range(50):
-            scores = bm25_score(preprocess(cuestionario[i]['question']), docs, idf, avgdl, k=1.2, b=0.75)
-            top_k_idx = np.argsort(scores)[::-1][:k]
-            # Recuperamos los textos
-            context.append("\n".join([corpus[j]["text"] for j in top_k_idx]))
+
+# MODIFICACIÓN un poco mala, no la entiendo mucho... (Se la pedí a ChatGPT)
+    # --- BÚSQUEDA BM25 PARA CADA PREGUNTA ---
+    num_preguntas = min(len(cuestionario), 50) # Lo dejamos como variable de elección
+
+    for i in range(num_preguntas):
+        # Preprocesamos la query
+        query_tokens = preprocess(cuestionario[i]['question'])
+
+        # BM25 score (ya optimizado previamente)
+        scores = bm25_score(query_tokens, docs, idf, avgdl, k=1.2, b=0.75)
+
+        # Opción más eficiente que argsort (top-k sin ordenar todo)
+        top_k_idx = np.argpartition(scores, -k)[-k:]
+        # Ordenarlos descendentemente (solo k elementos)
+        top_k_idx = top_k_idx[np.argsort([scores[t] for t in top_k_idx])[::-1]]
+
+        # Recuperamos los textos
+        context.append("\n".join(corpus[j]["text"] for j in top_k_idx))
+
+
+
 
     elif tipo_contexto == 2:
         # particularidades de dense retrieval
@@ -232,7 +272,7 @@ def evaluacion (context, cuestionario, schema_mcq, client, n_preguntas, n_iterac
             else:
                 fallos += 1
 
-            time.sleep(6.1)
+            time.sleep(6.1) # Esto por qué, por ser gratis?
         resultados[i][n_preguntas] = aciertos
         resultados[i][n_preguntas + 1] = fallos
     return resultados
