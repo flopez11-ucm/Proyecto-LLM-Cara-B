@@ -1,0 +1,260 @@
+import os
+import json
+from google import genai
+from pypdf import PdfReader
+import string #usado para pre-procesar
+from collections import Counter #usado para calcular IDF
+from sentence_transformers import SentenceTransformer  # hacer embeddings
+import time
+import numpy as np
+import math  # para fórmula IDF
+import faiss
+from datetime import datetime
+
+# directorio donde está este script
+BASE_DIR = os.path.dirname(__file__)
+
+# rutas relativas
+pdf_path = os.path.join(BASE_DIR, "paper.pdf")
+json_path = os.path.join(BASE_DIR, "ModelizaciónEmpresaUCMData.json")
+
+
+# Funciones helper
+
+#MODIFICADA
+def load_pdf():
+    reader = PdfReader(pdf_path)
+    pages = []
+    for page in reader.pages:
+        text = page.extract_text()
+        if text:
+            pages.append(text)
+    return "\n".join(pages)
+
+def load_json():
+    with open(json_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def get_api_key() -> str:
+    return os.getenv("GOOGLE_API_KEY", "AIzaSyA66qJRDqjbWjQ-zTS-eQ4uEJSFG9j8re8")
+
+def load_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "answer": {
+                "type": "string",
+                "enum": ["A", "B", "C", "D"]
+            }
+        },
+        "required": ["answer"]
+    }
+
+def chunking(tipo: int):
+    paper = load_pdf()
+    if tipo == 0:
+        return fixed_lenght_chunking(paper, 200, 50)
+def fixed_lenght_chunking(text: str, chunk_size: int, overlap: int):
+    """
+    Divide un texto en chunks de tamaño `chunk_size` (en número de palabras),
+    con `overlap` palabras superpuestas entre chunks consecutivos.
+
+    Args:
+        text: texto completo a chunkear
+        chunk_size: número de palabras por chunk
+        overlap: número de palabras que se repiten entre chunks consecutivos
+
+    Returns:
+        Lista de strings, cada una es un chunk
+    """
+    words = text.split()
+    chunks = []
+    start = 0
+    chunk_id = 0
+
+    while start < len(words):
+        end = start + chunk_size
+        chunk = words[start:end]
+        chunks.append({
+            "id": chunk_id,
+            "text": " ".join(chunk)
+        })
+        start += chunk_size - overlap  # superposición
+        chunk_id += 1
+    return chunks
+
+#Función que determina la k de BM25, que incluye como contexto los top-k chunks
+def cantidad_chunks_retrieval():
+    k: int = 3
+    return k
+
+
+#Cargamos las palabras frecuentes en el lenguaje que no aportan valor
+stop_words = {"el", "la", "los", "las", "de", "y", "a", "en", "que"}
+
+#Función para pre-procesar el texto
+def preprocess(text):
+    text = text.lower()
+    for p in string.punctuation:
+        text = text.replace(p, " ")
+    tokens = text.split()
+    tokens = [t for t in tokens if t not in stop_words]
+    return tokens
+
+########################################
+
+#Función que va a calificar cada chunk con una score
+#en función de cuánta relación tiene el chunk con la query en cuestión
+def bm25_score(query_tokens, docs, idf, avgdl, k = 1.2, b = 0.75):
+    scores = []
+    for doc in docs:
+        score = 0
+        doc_len = len(doc)
+        freq = Counter(doc)
+
+        for term in query_tokens:
+            if term in freq:
+                numerator = freq[term] * (k + 1)
+                denominator = freq[term] + k * (1 - b + b * doc_len / avgdl)
+                score += idf[term] * (numerator / denominator)
+
+        scores.append(score)
+    return scores
+
+
+
+def get_contexto(tipo_contexto: int = 0, k: int = 5, tipo_chunk: int = 0, cuestionario: list[dict] = load_json()):
+    # Hacemos estrategia de chunking de longitud-fija
+    dict_chunks: dict = chunking(tipo_chunk)
+
+    # Creamos una lista de chunks
+    corpus = [
+        {
+            "id": chunk["id"],
+            "text": chunk["text"],
+            "tokens": preprocess(chunk["text"])
+        }
+        for chunk in dict_chunks
+    ]
+
+    context = []
+
+    if tipo_contexto == 0:  # cuerpo baseline
+        context = [""] * 50
+
+    elif tipo_contexto == 1:
+        # particularidades de bm25
+        docs = [c["tokens"] for c in corpus]
+        N = len(docs)
+        doc_lengths = [len(d) for d in docs]
+        avgdl = sum(doc_lengths) / N
+
+        # Registraremos en df(term) la cantidad de chunks en los que aparece term
+        df = Counter()
+
+        for doc in docs:
+            unique_terms = set(doc)
+            for term in unique_terms:
+                df[term] += 1
+
+        # Inverse Document Frequency
+        # Diccionario que contiene el IDF de cada palabra en los chunks
+        idf = {term: math.log(1 + (N - df[term] + 0.5) / (df[term] + 0.5)) for term in df}
+
+        for i in range(50):
+            scores = bm25_score(preprocess(cuestionario[i]['question']), docs, idf, avgdl, k=1.2, b=0.75)
+            top_k_idx = np.argsort(scores)[::-1][:k]
+            # Recuperamos los textos
+            context.append("\n".join([corpus[j]["text"] for j in top_k_idx]))
+
+    elif tipo_contexto == 2:
+        # particularidades de dense retrieval
+        docs = [c["text"] for c in corpus]
+
+        # Cargamos el modelo de embeddings
+        model = SentenceTransformer("all-MiniLM-L6-v2")
+
+        # Generamos embeddings de todos los chunks en el corpus
+        embeddings = model.encode(docs, convert_to_numpy=True)
+        # y los adaptamos al tipo que necesita float32
+        embeddings = embeddings.astype('float32')
+
+        index = faiss.IndexFlatL2(embeddings.shape[1])  # L2 = distancia euclidiana
+        index.add(embeddings)  # agregamos todos los chunks
+
+        for i in range(50):
+            query_emb = model.encode([cuestionario[i]['question']], convert_to_numpy=True)
+            query_emb = query_emb.astype('float32')
+
+            distances, top_k_idx = index.search(query_emb, k)
+            top_k_idx = top_k_idx[0]  # top k índices del primer query
+
+            # Recuperamos los textos
+            context.append("\n".join([corpus[j]["text"] for j in top_k_idx]))
+    return context
+
+
+
+
+def evaluacion (context, cuestionario, schema_mcq, client, n_preguntas, n_iteraciones):
+    resultados = [["" for _ in range(n_preguntas + 2)] for _ in range(n_iteraciones)]
+    for i in range(n_iteraciones):
+        aciertos = 0
+        fallos = 0
+        for j in range(min(len(cuestionario), n_preguntas)):
+            pregunta = f"""
+            Responde a la siguiente pregunta de opción múltiple ÚNICAMENTE usando la información del CONTEXTO.
+            CONTEXTO:
+            {context[j]}
+            PREGUNTA:
+            {cuestionario[j]['question']}
+            OPCIONES:
+            A. {cuestionario[j]['answers']['A']}
+            B. {cuestionario[j]['answers']['B']}
+            C. {cuestionario[j]['answers']['C']}
+            D. {cuestionario[j]['answers']['D']}
+            """
+            response = client.models.generate_content(
+                model = "gemini-2.5-flash",
+                contents = pregunta,
+                config = {
+                    "response_mime_type": "application/json",
+                    "response_schema": schema_mcq
+                }
+            )
+
+            raw_text = response.candidates[0].content.parts[0].text
+            respuesta = json.loads(raw_text)["answer"]
+
+            resultados[i][j] = respuesta
+            if (respuesta == cuestionario[j]["correct_answer"]):
+                aciertos += 1
+            else:
+                fallos += 1
+
+            time.sleep(6.1)
+        resultados[i][n_preguntas] = aciertos
+        resultados[i][n_preguntas + 1] = fallos
+    return resultados
+
+
+
+def guardar_resultado(
+    nombre_fichero,
+    modelo,
+    chunking,
+    resultados,
+    contexto,
+    k
+):
+    entrada = {
+        "timestamp": datetime.now().isoformat(),
+        "modelo": modelo,                     # "BM25" o "Dense"
+        "chunking": chunking,                 # tipo de chunking usado
+        "resultados": resultados,
+        "chunks_recuperados": contexto,  # lista de IDs o textos
+        "num_chunks": k
+    }
+
+    with open(nombre_fichero, "a", encoding="utf-8") as f:
+        json.dump(entrada, f, ensure_ascii = False, indent = 4)
