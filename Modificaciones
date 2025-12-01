@@ -121,27 +121,6 @@ def bm25_score(query_tokens, docs, idf, avgdl, k = 1.2, b = 0.75):
         scores.append(score)
     return scores
 
-# MODIFICACION, extraemos el bm25
-def build_bm25(corpus):
-    docs = [c["tokens"] for c in corpus]
-    N = len(docs)
-    doc_lengths = [len(d) for d in docs]
-    avgdl = sum(doc_lengths) / N
-
-    df = Counter()
-    for doc in docs:
-        df.update(set(doc))
-
-    idf = {term: math.log(1 + (N - df[term] + 0.5) / (df[term] + 0.5)) for term in df}
-
-    return docs, idf, avgdl
-
-
-
-
-
-
-
 def get_contexto(tipo_contexto: int = 0, k: int = 5, tipo_chunk: int = 0, cuestionario: list[dict] = load_json()):
     # Hacemos estrategia de chunking de longitud-fija
     dict_chunks: dict = chunking(tipo_chunk)
@@ -206,7 +185,7 @@ def get_contexto(tipo_contexto: int = 0, k: int = 5, tipo_chunk: int = 0, cuesti
 
 
 
-
+# Requiere MODIFICACIÓN, precomputar, esto genera un embedding nuevo cada vez.
     elif tipo_contexto == 2:
         # particularidades de dense retrieval
         docs = [c["text"] for c in corpus]
